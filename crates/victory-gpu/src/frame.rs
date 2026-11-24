@@ -204,23 +204,65 @@ mod tests {
 
         // The title's loop (the clock is global, so in the same test): an
         // origin poll that times out (and starts the frame), then a
-        // blocking flip wait. Each flip takes its own tick.
+        // blocking flip wait. Each flip takes its own tick, the next one
+        // unless the thread woke late (a loaded machine oversleeps): then
+        // it skips only the ticks that passed meanwhile.
         const FLIP: u32 = 2;
-        assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
+        const INTERVAL: Duration = Duration::from_millis(5);
+        // The test's own clock: the interval starts between `t0` and `t1`,
+        // counting from the last tick handed out.
+        let base = LAST
+            .iter()
+            .map(|t| t.load(Ordering::Relaxed))
+            .max()
+            .unwrap();
+        let t0 = Instant::now();
+        assert_eq!(
+            set_interval(null, null, INTERVAL.as_micros() as u32, 3, 0),
+            S_OK
+        );
+        let t1 = Instant::now();
+        let tick_after = |since: Instant, at: Instant| {
+            base + (at.duration_since(since).as_nanos() / INTERVAL.as_nanos()) as u64 + 1
+        };
         let mut token = 0;
-        let flips: Vec<u64> = (0..4)
-            .map(|_| {
-                let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
-                assert_eq!(
-                    wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
-                    S_OK
-                );
-                LAST[2].load(Ordering::Relaxed)
-            })
-            .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        let mut flips: Vec<u64> = Vec::new();
+        let mut exact = 0;
+        // Four flips, and more (up to 32) until one lands exactly on the
+        // tick our clock expects: a tick boundary may fall between our
+        // reading and the wait's own.
+        while flips.len() < 4 || (exact == 0 && flips.len() < 32) {
+            let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
+            let prev = flips.last().map_or(0, |&f| f + 1);
+            let asked = Instant::now();
+            let due = tick_after(t1, asked).max(prev);
+            assert_eq!(
+                wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+                S_OK
+            );
+            let woke = Instant::now();
+            let latest = tick_after(t0, woke).max(prev);
+            let flip = LAST[2].load(Ordering::Relaxed);
+            // The wait slept until its tick (the interval starts at `t0` or
+            // later), so it never ends early. 1 ms covers a sleep that wakes
+            // a little before its deadline.
+            assert!(
+                woke + Duration::from_millis(1) >= t0 + INTERVAL * (flip - base) as u32,
+                "{flips:?}: woke early for {flip}"
+            );
+            // A new tick, not before the one due when the wait was called,
+            // and no later than the ticks that passed during the call (a
+            // late wake-up skips those).
+            assert!(
+                flip >= due && flip <= latest && flip >= prev,
+                "{flips:?}: {flip} not in {due}..={latest}"
+            );
+            exact += usize::from(flip == due);
+            flips.push(flip);
+        }
+        assert!(exact > 0, "no flip on the expected tick: {flips:?}");
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
-        assert!(tick > flips[3]);
+        assert!(tick > *flips.last().unwrap());
     }
 }
