@@ -3284,39 +3284,55 @@ impl<'a> Lower<'a> {
     // driver does 1 ULP off the hardware's correctly rounded conversion for
     // some values; correct it with an integer check if a title compares
     // converted values exactly.
-    fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
+    fn format_load(
+        &mut self,
+        h: V,
+        off: V,
+        format: u8,
+        channels: u32,
+        root_size: Option<V>,
+    ) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-        let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
-            let mask = l.s.m.i8((1u8 << n) - 1);
-            let r = l.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                l.s.t.res_ret,
-                139,
-                &[h, at, u, mask, align],
-            );
-            (0..n)
-                .map(|k| {
-                    let x = l.s.m.extract(c, r, k);
-                    l.as_int(x)
-                })
-                .collect()
-        };
-        let words = if total < 32 {
+        let sub_dword = total < 32;
+        let n = (total / 32).max(1);
+        let at = if sub_dword {
             // A byte or half inside the dword that holds it.
-            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
-            let w = load(self, at, 1)[0];
+            let not3 = self.s.m.i32(!3);
+            self.s.m.bin(c, Bin::And, off, not3)
+        } else {
+            off
+        };
+        let (at, root_ok) = match root_size {
+            Some(size) => {
+                let (ok, at) = self.in_root_view(size, at, 4 * n);
+                (at, Some(ok))
+            }
+            None => (at, None),
+        };
+        let mask = self.s.m.i8((1u8 << n) - 1);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, at, u, mask, align],
+        );
+        let mut words: Vec<_> = (0..n)
+            .map(|k| {
+                let x = self.s.m.extract(c, r, k);
+                self.as_int(x)
+            })
+            .collect();
+        if sub_dword {
+            let three = self.s.m.i32(3);
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-            vec![self.s.m.bin(c, Bin::LShr, w, sh)]
-        } else {
-            load(self, off, total / 32)
-        };
+            words[0] = self.s.m.bin(c, Bin::LShr, words[0], sh);
+        }
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
         let mut at = 0;
@@ -3393,7 +3409,10 @@ impl<'a> Lower<'a> {
             out.push(self.s.m.i32(if k == 3 { one } else { 0 }));
         }
         out.truncate(channels as usize);
-        Ok(out)
+        Ok(out
+            .into_iter()
+            .map(|x| self.zero_unless(root_ok, x))
+            .collect())
     }
 
     /// The byte offset a buffer descriptor built around a root descriptor adds
@@ -6462,12 +6481,11 @@ impl<'a> Lower<'a> {
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
-        // Root views: the bytes accessed checked against the view's size
-        // (raw accesses, and the raw loads formatted ones make).
-        let (off, root_ok) = match self.root_view_size(src) {
-            Some(size) if !typed || format.is_some() => {
-                let bytes = if format.is_some() { 16 } else { 4 * count };
-                let (ok, at) = self.in_root_view(size, off, bytes);
+        // Formatted loads handle bounds at their actual raw load address.
+        let root_size = self.root_view_size(src);
+        let (off, root_ok) = match root_size {
+            Some(size) if !typed && format.is_none() => {
+                let (ok, at) = self.in_root_view(size, off, 4 * count);
                 (at, Some(ok))
             }
             _ => (off, None),
@@ -6596,8 +6614,11 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
-                let x = self.zero_unless(root_ok, x);
+            for (k, x) in self
+                .format_load(h, off, f, count, root_size)?
+                .into_iter()
+                .enumerate()
+            {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

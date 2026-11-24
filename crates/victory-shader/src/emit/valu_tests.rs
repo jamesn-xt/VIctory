@@ -962,16 +962,46 @@ fn root_view_reads_stop_at_the_bound_size() {
     words.extend_from_slice(&buffer_load_dword_offen(0, 1, 8));
     words.extend_from_slice(&buffer_store_dword(0, 12, 0));
     words.push(S_ENDPGM);
-    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let root = |root, sgprs, user_data, slot| RootParam {
-        root,
+    let cases = &[
+        (0, 64, 0x100),
+        (60, 64, 0x10F),
+        (64, 64, 0),
+        (128, 64, 0),
+        (u32::MAX - 3, 64, 0),
+    ];
+    root_view_loads(words, cases);
+}
+
+#[test]
+fn formatted_root_view_reads_use_the_access_width() {
+    // MTBUF tbuffer_load_format_x with BUF_FMT_32_UINT or BUF_FMT_8_UINT.
+    // The latter reads byte 61 from the aligned dword at byte 60.
+    for (insn, offset, expected) in [(0xE8A01000, 60, 0x10F), (0xE8281000, 61, 1)] {
+        let mut words = vec![s_mov_b32(5, 0x80)];
+        words.extend_from_slice(&s_load_dwordx4(12, 4));
+        words.push(s_mov_b32(10, 0xC1));
+        words.push(s_mov_b32(11, 0x80));
+        words.push(vop1(0x001, 1, sgpr(0)));
+        words.extend_from_slice(&[insn, 0x80020001]);
+        words.extend_from_slice(&buffer_store_dword(0, 12, 0));
+        words.push(S_ENDPGM);
+        root_view_loads(words, &[(offset, 64, expected), (offset, 63, 0)]);
+    }
+}
+
+fn root(kind: RootType, sgprs: u32, user_data: u8, slot: u8) -> RootParam {
+    RootParam {
+        root: kind,
         table_offset_dwords: 0,
         sgprs,
         base_register: 0,
         user_data,
         slot,
-    };
-    let used = |kind, root, user_data, slot| UsedResource {
+    }
+}
+
+fn used(kind: ResourceType, root: RootType, user_data: u8, slot: u8) -> UsedResource {
+    UsedResource {
         kind,
         root,
         table_offset_dwords: 0,
@@ -980,7 +1010,11 @@ fn root_view_reads_stop_at_the_bound_size() {
         dwords: 4,
         user_data,
         slot,
-    };
+    }
+}
+
+fn root_view_loads(words: Vec<u32>, cases: &[(u32, u32, u32)]) {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -1048,18 +1082,12 @@ fn root_view_reads_stop_at_the_bound_size() {
             continue;
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        for (offset, want) in [
-            (0, 0x100),
-            (60, 0x10F),
-            (64, 0),
-            (128, 0),
-            (u32::MAX - 3, 0),
-        ] {
+        for &(offset, size, want) in cases {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
                 ud[u.index as usize] = match u.root {
                     RootType::Constants => offset,
-                    RootType::Descriptor => 64,
+                    RootType::Descriptor => size,
                     _ => 0,
                 };
             }
