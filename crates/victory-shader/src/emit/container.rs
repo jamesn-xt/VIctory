@@ -231,19 +231,18 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     // Names of arbitrary semantics (system values use ""), then indices.
+    // As in `ISG1`/`OSG1`, DXC keys its string table by each element's own
+    // name buffer, so validator 1.6 expects one string per arbitrary
+    // semantic element in element order, repeats included.
     let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
         let name = if e.kind == 0 {
-            let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+            let at = strings.len();
+            strings.extend(e.name.bytes());
+            strings.push(0);
+            at
         } else {
             0
         };
@@ -300,10 +299,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.
@@ -415,5 +410,118 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mesh_and_vertex_signatures_with_repeated_and_suffix_names_validate() {
+        use crate::emit::bitcode::{Attr, Term};
+        use crate::emit::shader::{Mesh, Shader};
+        use crate::emit::validator::Validator;
+
+        let el = |name: &str, index, kind, interp, row| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+
+        // Mesh shader with repeated TEXCOORD vertex outputs and repeated
+        // CUSTOM primitive outputs: validator 1.6 expects one PSV0 string
+        // entry per element rather than shared offsets.
+        let mut ms = Shader::new(false);
+        ms.threads = Some([1, 1, 1]);
+        ms.mesh = Some(Mesh {
+            max_vertices: 3,
+            max_primitives: 1,
+            topology: 2,
+        });
+        ms.outputs = vec![
+            el("SV_Position", 0, 3, 4, 0),
+            el("TEXCOORD", 0, 0, 2, 1),
+            el("TEXCOORD", 1, 0, 2, 2),
+        ];
+        ms.prims = vec![
+            SigElement {
+                comp: 5,
+                cols: 1,
+                usage: 1,
+                ..el("CUSTOM", 0, 0, 1, 0)
+            },
+            SigElement {
+                comp: 5,
+                cols: 1,
+                usage: 1,
+                ..el("CUSTOM", 1, 0, 1, 1)
+            },
+        ];
+        let b = ms.entry;
+        let (v3, p1) = (ms.m.i32(3), ms.m.i32(1));
+        ms.op(b, "setMeshOutputCounts", Attr::NoUnwind, ms.t.void, 168, &[v3, p1]);
+        let (z, o, t) = (ms.m.i32(0), ms.m.i32(1), ms.m.i32(2));
+        ms.op(b, "emitIndices", Attr::NoUnwind, ms.t.void, 169, &[z, z, o, t]);
+        for vert in 0..3u32 {
+            let vi = ms.m.i32(vert);
+            for (id, e) in ms.outputs.clone().iter().enumerate() {
+                for c in 0..e.cols {
+                    let args = [ms.m.i32(id as u32), ms.m.i32(0), ms.m.i8(c), ms.m.f32(0), vi];
+                    ms.op(b, "storeVertexOutput.f32", Attr::NoUnwind, ms.t.void, 171, &args);
+                }
+            }
+        }
+        for id in 0..2u32 {
+            let args = [ms.m.i32(id), ms.m.i32(0), ms.m.i8(0), ms.m.i32(0), z];
+            ms.op(b, "storePrimitiveOutput.i32", Attr::NoUnwind, ms.t.void, 172, &args);
+        }
+        ms.m.terminate(b, Term::Ret);
+        let mut ms_dxil = ms.finish();
+
+        // Vertex shader with repeated TEXCOORD and suffix-overlapping BCOLOR / COLOR.
+        let mut vs = Shader::new(false);
+        vs.outputs = vec![
+            el("SV_Position", 0, 3, 4, 0),
+            el("TEXCOORD", 0, 0, 2, 1),
+            el("TEXCOORD", 1, 0, 2, 2),
+            el("BCOLOR", 0, 0, 2, 3),
+            el("COLOR", 0, 0, 2, 4),
+        ];
+        let b = vs.entry;
+        for id in 0..vs.outputs.len() as u32 {
+            for c in 0..4u8 {
+                let args = [vs.m.i32(id), vs.m.i32(0), vs.m.i8(c), vs.m.f32(0)];
+                vs.op(b, "storeOutput.f32", Attr::NoUnwind, vs.t.void, 5, &args);
+            }
+        }
+        vs.m.terminate(b, Term::Ret);
+        let mut vs_dxil = vs.finish();
+
+        let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        // Validator 1.6 expects one PSV0 string-table entry per arbitrary
+        // semantic element in element order, repeats included.
+        let psv_strings = |dxil: &[u8]| -> Vec<u8> {
+            let c = crate::dxbc::Container::parse(dxil).unwrap();
+            let psv = c.part(crate::dxbc::FourCC::PSV0).unwrap().data;
+            let len = u32::from_le_bytes(psv[56..60].try_into().unwrap()) as usize;
+            psv[60..60 + len].to_vec()
+        };
+        assert_eq!(
+            psv_strings(&ms_dxil),
+            b"\0TEXCOORD\0TEXCOORD\0CUSTOM\0CUSTOM\0\0\0\0"
+        );
+        assert_eq!(
+            psv_strings(&vs_dxil),
+            b"\0TEXCOORD\0TEXCOORD\0BCOLOR\0COLOR\0"
+        );
+        validator.validate(&mut ms_dxil).expect("mesh PSV0 validation");
+        validator.validate(&mut vs_dxil).expect("vertex PSV0 validation");
     }
 }
