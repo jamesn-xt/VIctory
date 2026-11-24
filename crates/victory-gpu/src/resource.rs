@@ -293,7 +293,9 @@ fn host_lacks_target(_: u32) -> bool {
 /// the format as the host has it. Textures only sampled keep theirs.
 pub(crate) fn target_format(format: u32) -> u32 {
     let format = pc_format(format);
-    if PACKED_16.contains(&format) && host_lacks_target(format) {
+    if format == 67 {
+        10 // RGB9E5 cannot be a render target or UAV on PC D3D12.
+    } else if PACKED_16.contains(&format) && host_lacks_target(format) {
         RGBA8_UNORM
     } else {
         format
@@ -527,6 +529,12 @@ pub(crate) fn family(format: u32) -> u32 {
 
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+
+/// The original texture format, before host substitutions.
+#[cfg(windows)]
+pub(crate) fn texture_format(this: This) -> u32 {
+    resource(this).desc.format
+}
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
@@ -2177,18 +2185,54 @@ mod tests {
     }
 
     #[test]
-    fn target_format_is_identity_for_non_packed_formats() {
+    fn target_format_is_identity_outside_target_substitutions() {
         for format in 0..=200u32 {
             if PACKED_16.contains(&format) {
                 assert!(
                     [format, RGBA8_UNORM].contains(&target_format(format)),
                     "unexpected target format for {format}"
                 );
+            } else if format == 67 {
+                assert_eq!(target_format(format), 10);
             } else if (118..=120).contains(&format) {
                 assert_eq!(target_format(format), format - 118 + 45);
             } else {
                 assert_eq!(target_format(format), format, "format {format}");
             }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r9g9b9e5_render_target_and_uav_textures_create_on_host() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        assert_eq!(pc_format(67), 67);
+        for (flags, expected) in [(0, 67), (4, 10), (5, 10)] {
+            let desc = ResourceDesc {
+                dimension: 3,
+                alignment: 0,
+                width: 64,
+                height: 64,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format: 67,
+                sample_count: 1,
+                sample_quality: 0,
+                layout: 0,
+                flags,
+            };
+            let mut out = std::ptr::null();
+            assert_eq!(create_committed(
+                std::ptr::null(), &PROPERTIES, 0, &desc, 0, std::ptr::null(),
+                &RESOURCE_IIDS[0], &mut out,
+            ), S_OK);
+            let texture = host_resource(out).expect("host texture created");
+            // SAFETY: a live host texture.
+            assert_eq!(unsafe { texture.GetDesc() }.Format.0 as u32, expected);
+            assert_eq!(view_format(out), None);
+            assert_eq!(slot::<Release>(out, 0x10)(out), 0);
         }
     }
 
