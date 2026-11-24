@@ -465,7 +465,10 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
         for (i, inst) in block.insts.iter().enumerate() {
             let name = inst.name();
-            let ops: Vec<Operand> = match &inst.fields {
+            if st.guards[b][i].is_some() {
+                continue; // lanes outside EXEC keep another value
+            }
+            let alike = match &inst.fields {
                 Fields::Valu(v)
                     if v.dpp.is_none()
                         && v.sdwa.is_none()
@@ -473,26 +476,40 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                         && !name.starts_with("v_cmpx")
                         && !name.contains("lane") =>
                 {
-                    v.src.clone()
+                    v.src.iter().all(|op| match *op {
+                        Operand::Vector { reg, dwords } => {
+                            // every dword of the operand the instruction reads (not the old value
+                            // of a higher-numbered destination register that IR keeps for guards)
+                            let end = reg.saturating_add(dwords);
+                            let read: Vec<Value> = inst
+                                .reads
+                                .iter()
+                                .filter(|r| matches!(r.0, Reg::V(x) if x >= reg && x < end))
+                                .map(|r| r.1)
+                                .collect();
+                            !read.is_empty() && read.iter().all(|x| same.contains(x))
+                        }
+                        // a scalar is one value; a lane mask is not, unless a compare of such values made it
+                        Operand::Scalar { code, dwords } if code != NULL => {
+                            (code..code.saturating_add(dwords)).all(|c| {
+                                inst.read(Reg::S(c)).is_none_or(|x| !is_mask(x) || same.contains(&x))
+                            })
+                        }
+                        _ => true,
+                    })
                 }
-                _ => continue,
+                Fields::Ds {
+                    addr: Some(Operand::Vector { reg, .. }),
+                    gds: false,
+                    ..
+                } if name.starts_with("ds_read") && !name.contains("_d16") => {
+                    // An unguarded LDS read from a wave-uniform address gives the same value
+                    // in every arriving lane. `_d16` forms preserve the other half of the
+                    // destination register and are left out.
+                    inst.read(Reg::V(*reg)).is_some_and(|x| same.contains(&x))
+                }
+                _ => false,
             };
-            if st.guards[b][i].is_some() {
-                continue; // lanes outside EXEC keep another value
-            }
-            let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
-                    !read.is_empty() && read.iter().all(|x| same.contains(x))
-                }
-                // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                Operand::Scalar { code, .. } if code != NULL => {
-                    inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
-                }
-                _ => true,
-            });
             if alike {
                 same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
             }
@@ -11823,5 +11840,82 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn first_lane_read_of_uniform_lds_load_lowers_on_wave32() {
+        // Wave64 compute program lowered for a 32-lane host: inside a divergent
+        // branch (`v0 < 1`), read LDS at a uniform address (`v1 = s16`), add a
+        // scalar (`v8 = s17 + v2`), and read the first lane into `s17`.
+        // When `ds_read_b32` reads from the uniform `v1`, `v8` is wave-uniform
+        // and `v_readfirstlane_b32` needs no cross-half exchange. When it reads
+        // from per-lane `v0`, the divergent read must still be refused.
+        let make = |addr_vgpr: u32| -> Vec<u32> {
+            vec![
+                0xBE90_0380,            // s_mov_b32 s16, 0
+                0xBE91_0380,            // s_mov_b32 s17, 0
+                0xD760_0004,            // v_readlane_b32 s4, v0, 0 (triggers wave64 exchange)
+                0x0001_0100,
+                0x7D88_0081,            // v_cmp_gt_u32_e32 vcc, 1, v0
+                0xBE86_246A,            // s_and_saveexec_b64 s[6:7], vcc
+                0xBF88_0005,            // s_cbranch_execz -> restore exec
+                0x7E02_0210,            // v_mov_b32 v1, s16
+                0xD8D8_0000,            // ds_read_b32 v2, v{addr}
+                0x0200_0000 | addr_vgpr,
+                0x4A10_0411,            // v_add_nc_u32 v8, s17, v2
+                0x7E22_0508,            // v_readfirstlane_b32 s17, v8
+                0xBEFE_0406,            // s_mov_b64 exec, s[6:7]
+                0x8011_0411,            // s_add_u32 s17, s17, s4 (keep s17 and s4 live)
+                0x7E06_0211,            // v_mov_b32 v3, s17
+                0xD834_0000,            // ds_write_b32 v0, v3
+                0x0000_0300,
+                S_ENDPGM,
+            ]
+        };
+        let run = |words: &[u32]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 256,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 15, // 512 bytes LDS
+                    threads: [128, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, true, 256).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let prev = super::TEST_HOST_WAVE.replace(Some(32));
+            let out = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            });
+            super::TEST_HOST_WAVE.set(prev);
+            out
+        };
+
+        if let Err(e) = run(&make(1)) {
+            panic!("uniform ds_read_b32 + scalar add must be recognised as wave-uniform, got: {e}");
+        }
+        let err = run(&make(0))
+            .err()
+            .expect("per-lane ds_read_b32 must be refused")
+            .to_string();
+        assert!(
+            err.contains("a first-lane read where not every lane runs"),
+            "per-lane ds_read_b32 must still require all lanes, got: {err}"
+        );
     }
 }
