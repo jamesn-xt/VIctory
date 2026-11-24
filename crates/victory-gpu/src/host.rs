@@ -1797,6 +1797,33 @@ impl Host {
     /// captures are on). `None` if nothing was shown; else, in diagnostics
     /// builds, whether the frame was black.
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.present_with_target(planes, frame, crate::capture::shown_target().as_deref())
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            self.present_with_compositor(planes, frame, Compositor::new)
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn present_with_target(
+        &self,
+        planes: &[(&ID3D12Resource, u32)],
+        frame: u64,
+        target: Option<&crate::resource::HostTexture>,
+    ) -> Option<bool> {
+        if let Some(target) = target {
+            let state = target.state.load(Ordering::Relaxed);
+            if let Some(shown) = self.present_with_compositor(
+                &[(&target.texture, state)],
+                frame,
+                Compositor::new,
+            ) {
+                return Some(shown);
+            }
+        }
         self.present_with_compositor(planes, frame, Compositor::new)
     }
 
@@ -2488,6 +2515,9 @@ mod present_plane_tests {
         };
         let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
         let overlay = make_plane(32, 32, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let black = make_plane(32, 32, &[0.0; 4]);
+        let empty_overlay = make_plane(32, 32, &[0.0; 4]);
+        let preview = make_plane(16, 8, &[1.0, 0.0, 0.0, 1.0]);
         list.close();
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
@@ -2511,5 +2541,23 @@ mod present_plane_tests {
             host.present(&[(&scene, state)], 3).is_some(),
             "single-plane presentation after compositor initialization failed"
         );
+        let planes = [(&black, state), (&empty_overlay, state)];
+        assert_eq!(host.present_with_target(&planes, 4, None), Some(true));
+        let target = crate::resource::HostTexture {
+            texture: preview,
+            state: AtomicU32::new(state),
+        };
+        assert_eq!(
+            host.present_with_target(&planes, 5, Some(&target)),
+            Some(false),
+            "the nonblack target replaces both black presentation planes"
+        );
+        {
+            let guard = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+            let presenter = guard.as_ref().unwrap();
+            assert_eq!((presenter.width, presenter.height), (16, 8));
+        }
+        assert_eq!(target.state.load(Ordering::Relaxed), state);
+        assert_eq!(host.present_with_target(&planes, 6, None), Some(true));
     }
 }

@@ -213,8 +213,64 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_SHOW_TARGET=<w>x<h>-f<format>` (e.g. `2560x1440-f28`): the size and format of
+/// the render target to show in place of the title's frame.
+fn show_spec() -> Option<(u64, u32, i32)> {
+    static SPEC: std::sync::OnceLock<Option<(u64, u32, i32)>> = std::sync::OnceLock::new();
+    *SPEC.get_or_init(|| parse_show_spec(&std::env::var("VICTORY_SHOW_TARGET").ok()?))
+}
+
+/// `<w>x<h>-f<format>` as (width, height, DXGI format); `None` if malformed.
+fn parse_show_spec(v: &str) -> Option<(u64, u32, i32)> {
+    let (size, format) = v.trim().split_once("-f")?;
+    let (w, h) = size.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
+}
+
+#[cfg(test)]
+mod show_tests {
+    #[test]
+    fn show_spec_reads_size_and_format() {
+        assert_eq!(
+            super::parse_show_spec(" 2560x1440-f28 "),
+            Some((2560, 1440, 28))
+        );
+        assert_eq!(super::parse_show_spec("2560x1440"), None);
+        assert_eq!(super::parse_show_spec("2560-f28"), None);
+        assert_eq!(super::parse_show_spec("ax1440-f28"), None);
+    }
+}
+
+/// The last render target bound that matches [`show_spec`].
+static SHOWN: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
+    std::sync::Mutex::new(None);
+
+/// The selected target, held through presentation and its completed GPU work.
+/// The presenter uses this as its source, so multi-plane frames and captures
+/// show the same diagnostic image without a second copy path.
+pub(crate) fn shown_target() -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    SHOWN.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
+    if let Some((w, h, f)) = show_spec()
+        && let Some(copy) = crate::resource::host_copy(resource)
+    {
+        // SAFETY: a live resource.
+        let d = unsafe { copy.texture.GetDesc() };
+        if (d.Width, d.Height, d.Format.0) == (w, h, f)
+            && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && d.DepthOrArraySize == 1
+            && d.MipLevels == 1
+            && d.SampleDesc.Count == 1
+        {
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            FIRST.call_once(|| {
+                tracing::info!(width = w, height = h, format = f, "showing a diagnostic render target")
+            });
+            *SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+        }
+    }
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
