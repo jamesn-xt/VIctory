@@ -1,14 +1,14 @@
-# victory-gta6
+# VIctory fork (work in progress)
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
-compatibility layer that runs the Xbox Series build of Grand Theft Auto VI
-natively on Windows from files the user supplies. This fork follows upstream
+A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
+compatibility layer that runs an Xbox Series title natively on Windows from
+files the user supplies. This fork follows upstream
 `main` and adds fixes aimed at one goal: getting the game's world to render
 correctly and playably on one particular PC.
 
 **This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by Rockstar Games or
-Take-Two Interactive.
+copy of the game. It is not affiliated with or endorsed by the game's
+developer or publisher.
 
 ## Credits
 
@@ -80,7 +80,7 @@ status section describes upstream, not this fork.
 
 # VIctory
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
+Runs the title (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
@@ -213,6 +213,29 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
+
+
+## Fork notes: measured progress on one RTX 3060 12 GB (2026-11-24)
+
+Work on this fork, measured with `VICTORY_GPU_TIMING=1` and a frame grabber,
+same scene each time (the title's opening world, a city street):
+
+| change | before | after |
+| --- | --- | --- |
+| texture refresh without waiting on the remap lock (`VICTORY_TEXTURE_NO_WAIT=1`) | 312–545 ms a frame in texture work | 12–23 ms |
+| card-buffer copies kept on the card (`VICTORY_CARD_BUFFERS_MIN_MB=8`, `VICTORY_CARD_BUFFERS_MB=1536`) | heap pass 262 ms, 1 906 draws | heap pass 15–24 ms, 4 833 draws |
+| both together | 1.3–1.8 frames a second | 2.5–4 frames a second |
+
+The menu runs at a locked 30. Saves persist across restarts. Cutscenes render
+with light and subtitles.
+
+Wave64 → wave32: a console wave64 program runs on a 32-lane host as two host
+waves when its cross-lane code stays inside each half and its shared memory
+is ordered. This fork adds an analysis that also halves programs whose every
+shared-memory access names only the lane's own words (the address derives
+from the thread id), which needs no ordering at all: of 1 163 dumped compute
+programs, 37 more now run in waves of 32 than did before. The probe lives in
+`crates/victory-shader/examples` (`wave_why`, `lds_dump`, `validate_dump`).
 
 ## License
 
