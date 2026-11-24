@@ -156,6 +156,12 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Shader resource views in descriptor tables (root parameter slot,
+    /// dword in the table) the shader reads only through raw handles
+    /// (`ByteAddressBuffer`): the host makes a structured view there raw, as
+    /// NVIDIA bounds a raw read of a structured view by `NumElements * 4`
+    /// bytes (an RTX 3080 reads zero past them, WARP reads the data).
+    pub raw_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -308,6 +314,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        raw_views: l.raw_views,
     })
 }
 
@@ -565,6 +572,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            raw_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -575,6 +583,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                raw_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

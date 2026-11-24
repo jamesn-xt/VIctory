@@ -43,7 +43,14 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// See [`super::HostShader::raw_views`].
+    pub raw_views: Vec<(u8, u32)>,
 }
+
+/// [`Lower::view_kinds`]: a shader resource view read through a raw handle.
+const VIEW_RAW: u8 = 1;
+/// [`Lower::view_kinds`]: any other use (structured, typed, unordered access).
+const VIEW_OTHER: u8 = 2;
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
@@ -174,6 +181,10 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// Table slots whose descriptor sits at a fixed place (root parameter
+    /// slot, dword in the table): how the program reads them
+    /// ([`VIEW_RAW`], [`VIEW_OTHER`]).
+    view_kinds: HashMap<(u8, u32), u8>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -515,6 +526,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            view_kinds: HashMap::new(),
         }
     }
 
@@ -902,6 +914,18 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        let mut raw_views: Vec<(u8, u32)> = self
+            .view_kinds
+            .iter()
+            .filter(|&(_, &k)| k == VIEW_RAW)
+            .map(|(&at, _)| at)
+            .collect();
+        raw_views.sort_unstable();
+        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_SHADER_LOOP_LOG").is_some() {
+            let mut all: Vec<_> = self.view_kinds.iter().map(|(k, v)| (*k, *v)).collect();
+            all.sort_unstable();
+            eprintln!("view kinds (slot, dword, 1 raw 2 other): {all:?}");
+        }
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -913,6 +937,7 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            raw_views,
         })
     }
 
@@ -3308,6 +3333,10 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
+                if !sampler && let Some(at) = self.fixed_slot(*load, *first) {
+                    let kind = if props.0 == 11 { VIEW_RAW } else { VIEW_OTHER };
+                    *self.view_kinds.entry(at).or_default() |= kind;
+                }
                 let key = (self.cur, *load, *first, sampler, props.0);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
@@ -3524,6 +3553,30 @@ impl<'a> Lower<'a> {
 
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
+    /// The table slot (root parameter slot, dword in the table) of a
+    /// descriptor loaded at a fixed offset from a root table, as the title's
+    /// used-resource entries name it.
+    fn fixed_slot(&self, load: Site, first: u8) -> Option<(u8, u32)> {
+        let a = self.scalar.get(&load)?;
+        if a.dynamic.is_some() {
+            return None;
+        }
+        let rp = self.x.native.layout.get(a.param)?;
+        if rp.root != RootType::Table {
+            return None;
+        }
+        let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
+        let Fields::Smem { soffset, .. } = &li.fields else {
+            return None;
+        };
+        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            return None;
+        }
+        // The load's address already holds its immediate offset.
+        let bytes = a.offset.wrapping_add(4 * u32::from(first));
+        Some((rp.slot, bytes / 4))
+    }
+
     fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
         let a = *self
             .scalar
