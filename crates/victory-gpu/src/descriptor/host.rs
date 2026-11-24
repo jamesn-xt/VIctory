@@ -298,6 +298,10 @@ struct Waiting {
 pub(crate) struct TextureQueue {
     slots: std::collections::BTreeMap<u32, Waiting>,
     writes: u64,
+    /// Slots the pass made a host copy for, and when (ms): the copies a
+    /// slot holds are let go only by [`TextureQueue::evict`], or by the
+    /// slot's memory being unmapped.
+    resident: std::collections::BTreeMap<u32, u64>,
 }
 
 impl TextureQueue {
@@ -356,6 +360,29 @@ impl TextureQueue {
     /// The entry of `index` if it is still the write the pass was handed.
     fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
         self.slots.get_mut(&index).filter(|w| w.write == write)
+    }
+
+    /// The pass made slot `index` a host copy at `now` ms.
+    fn made_at(&mut self, index: u32, now: u64) {
+        self.resident.insert(index, now);
+    }
+
+    /// Takes out up to `n` of the slots made before `before` ms, the
+    /// oldest first: their copies are given up to make room for newer
+    /// writes (a copy a slot holds is never idle to the sweep).
+    fn evict(&mut self, before: u64, n: usize) -> Vec<u32> {
+        let mut old: Vec<(u64, u32)> = self
+            .resident
+            .iter()
+            .filter(|&(_, &at)| at < before)
+            .map(|(&i, &at)| (at, i))
+            .collect();
+        old.sort_unstable();
+        old.truncate(n);
+        for (_, i) in &old {
+            self.resident.remove(i);
+        }
+        old.into_iter().map(|(_, i)| i).collect()
     }
 
     /// Slot `index` is up to date: out of the queue until written again.
@@ -806,6 +833,32 @@ impl HostHeap {
         }
     }
 
+    /// The pass made title slot `index` a host copy at `now` ms.
+    pub(crate) fn texture_slot_made(&self, index: u32, now: u64) {
+        self.textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .made_at(index, now);
+    }
+
+    /// Makes room: up to `n` slots the pass made before `before` ms, the
+    /// oldest first, are made null so their host copies can go
+    /// ([`TextureQueue::evict`]). Returns how many were.
+    /// shortcut: oldest made first, not least sampled (a draw reading a
+    /// texture by index leaves no trace); one given up stays empty until
+    /// the title writes or maps it again. Upgrade by recording what draws
+    /// sample.
+    pub(crate) fn texture_slots_evict(&self, before: u64, n: usize) -> usize {
+        let out = self
+            .textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .evict(before, n);
+        out.into_iter()
+            .filter(|&i| self.texture_slot_gone(i))
+            .count()
+    }
+
     /// Nothing to upload at title slot `index` now (its memory is not
     /// mapped, or no more of it than before): looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
@@ -1219,7 +1272,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: constant_bytes(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -1833,6 +1886,15 @@ fn twin_uav(
     Some(desc)
 }
 
+/// The bytes of the host's constant buffer view for a title's of `size`:
+/// whole 256s, and at most the 64 KiB a shader can index. The host removes
+/// the device for a larger view, and the title's heap holds such sizes in
+/// slots it does not use.
+fn constant_bytes(size: u32) -> u32 {
+    const LARGEST: u32 = 64 << 10;
+    size.min(LARGEST).next_multiple_of(256)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -1851,7 +1913,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: constant_bytes(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -2259,6 +2321,35 @@ mod tests {
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
     }
 
+    /// A constant buffer view larger than the host takes is cut to what it
+    /// takes: the device, which such a view removes, stays.
+    #[test]
+    fn an_oversized_constant_buffer_view_leaves_the_device_alive() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        // SAFETY: a plain device query.
+        let alive = || unsafe { host.device.GetDeviceRemovedReason() }.is_ok();
+        // Made first: an allocation that fails on a removed device must not
+        // end the test early.
+        let (buffer, _) = host.upload_buffer(1 << 20).expect("an upload buffer");
+        let memory = vec![0u8; 2 << 20];
+        let at = (memory.as_ptr() as u64).next_multiple_of(64 << 10);
+        for size in [969_472u32, 896_256] {
+            assert!(make(&View::Constant(at, size), heap.cpu(0)).is_some());
+            assert!(alive(), "a view of {size} bytes");
+        }
+        // SAFETY: a live upload buffer.
+        heap.constant_at(1, unsafe { buffer.GetGPUVirtualAddress() }, 969_472);
+        assert!(alive(), "a view of the list's own memory");
+        assert_eq!(constant_bytes(480), 512);
+        assert_eq!(constant_bytes(64 << 10), 64 << 10);
+        assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+    }
+
     /// A null 3D UAV made on the real device leaves it alive.
     #[test]
     fn null_3d_uav_is_accepted_by_the_device() {
@@ -2297,6 +2388,18 @@ mod tests {
     /// slot whose memory is not there is looked at again after
     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
     /// slot written again meanwhile is dropped.
+    #[test]
+    fn eviction_takes_the_oldest_made_slots_and_spares_the_recent() {
+        let mut q = TextureQueue::default();
+        for (index, at) in [(5, 300), (1, 100), (9, 200), (2, 9_000)] {
+            q.made_at(index, at);
+        }
+        assert_eq!(q.evict(5_000, 2), [1, 9]);
+        assert_eq!(q.evict(5_000, 8), [5]);
+        assert!(q.evict(5_000, 8).is_empty());
+        assert_eq!(q.evict(10_000, 8), [2]);
+    }
+
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();
