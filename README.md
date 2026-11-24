@@ -153,8 +153,10 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads. While the title's window has focus, the keyboard
+supplements the first connected pad (including Enter = A). With none
+connected, it drives a stand-in pad. Keyboard directions take priority
+while pressed; releasing them restores the controller's stick values:
 
 | Keys | Pad |
 |------|-----|
