@@ -1335,6 +1335,17 @@ mod tests {
     /// there, and what it writes lands at its own bytes of title memory.
     #[test]
     fn structured_views_off_an_element_read_and_write_their_bytes() {
+        check_raw_buffer_reads(16, false);
+    }
+
+    #[test]
+    fn raw_only_structured_srv_reads_past_record_count_bound() {
+        // This offset is on a structured element, so the misalignment fallback
+        // cannot fix the raw read. Read all 128 bytes, beyond NumElements * 4.
+        check_raw_buffer_reads(32, true);
+    }
+
+    fn check_raw_buffer_reads(read_offset: u64, raw_only: bool) {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         use windows::core::s;
@@ -1410,7 +1421,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
 
         // A title buffer of 1 KiB, numbered dwords; four 32-byte elements
-        // from byte 16 are read, four from byte 272 written.
+        // from read_offset are read, four from byte 272 written.
         let before: Vec<u32> = (0..256).map(|i| 0x7171_0000 | i).collect();
         let mut title = before.clone();
         let start = title.as_mut_ptr() as u64;
@@ -1440,7 +1451,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Views the host refuses are left null, as `HostHeap::mirror` leaves them.
         let mut placed = [0; 14];
         placed[0] = 1; // a buffer
-        if buffer_srv(start + 16, 128, srv, at(0), false).is_none() {
+        if buffer_srv(start + read_offset, 128, srv, at(0), raw_only).is_none() {
             null_for(&View::Placed(false, placed, [0; 16]), at(0));
         }
         if buffer_uav(start + 272, 128, uav(written), at(1)).is_none() {
@@ -1477,7 +1488,12 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         // SAFETY: 32 dwords the GPU wrote, read after it finished.
         let seen = unsafe { std::slice::from_raw_parts(out.cast::<u32>(), 32) };
-        assert_eq!(seen, &before[4..36], "what the read view gave");
+        let read_start = (read_offset / 4) as usize;
+        assert_eq!(
+            seen,
+            &before[read_start..read_start + 32],
+            "what the read view gave"
+        );
         let marks: Vec<u32> = (0..32).map(|i| 0xc0de_0000 | i).collect();
         assert_eq!(&title[68..100], &marks[..], "what the written view left");
         assert_eq!(
