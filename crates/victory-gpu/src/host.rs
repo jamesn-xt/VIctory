@@ -2084,6 +2084,21 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     None
 }
 
+/// Whether any texture staging buffer refreshed by `runs` is still being
+/// read on the GPU by an unfinished flight (`in_flight > finished`):
+/// refreshing it now would overwrite its mapped upload buffer mid-copy.
+fn staging_in_flight_at(runs: &[&HostList], finished: u64) -> bool {
+    runs.iter().any(|list| {
+        list.deferred().copies.iter().any(|step| {
+            matches!(step, Step::Texture(staging) if staging.in_flight() > finished)
+        })
+    })
+}
+
+fn staging_in_flight(runs: &[&HostList]) -> bool {
+    staging_in_flight_at(runs, FINISHED.load(Ordering::Acquire))
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
@@ -2566,6 +2581,60 @@ mod late_tests {
             assert_eq!(touches(&ranges, from, to), hit, "{from}..{to}");
         }
         assert!(!touches(&[], 0, usize::MAX));
+    }
+
+    /// A texture staging buffer marked in flight for submission N blocks
+    /// later flights until `FINISHED` reaches N.
+    #[test]
+    fn staging_in_flight_tracks_submission_completion() {
+        let Some(host) = super::host() else { return };
+        let heap_words: [u32; 5] = [1, 0, 0, 1, 1];
+        let desc_words: [u32; 14] = [3, 0, 0, 0, 16, 0, 4, 65537, 28, 1, 0, 256, 0, 0];
+        // SAFETY: plain repr(C) structs matching D3D12 layouts.
+        let (heap, desc) = unsafe {
+            (
+                std::mem::transmute::<[u32; 5], crate::resource::HeapProperties>(heap_words),
+                std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(desc_words),
+            )
+        };
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut resource = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                &heap,
+                0,
+                &desc,
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut resource,
+            ),
+            crate::object::S_OK
+        );
+        let tex = crate::resource::host_resource(resource).expect("host texture");
+        let list = host.new_list().expect("host list");
+        crate::texture::upload(&list, resource, tex);
+        assert!(!super::staging_in_flight_at(&[&list], 0));
+        for step in &list.deferred().copies {
+            if let super::Step::Texture(staging) = step {
+                staging.mark_in_flight(10);
+            }
+        }
+        assert!(super::staging_in_flight_at(&[&list], 9));
+        assert!(!super::staging_in_flight_at(&[&list], 10));
+        assert!(!super::staging_in_flight_at(&[&list], 11));
+        list.close();
+        drop(list);
+        let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(
+            resource, 0x10,
+        );
+        assert_eq!(release(resource), 0);
     }
 }
 
@@ -3864,7 +3933,8 @@ impl Host {
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
-        // what they write.
+        // what they write or would overwrite an in-flight texture staging
+        // buffer.
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
@@ -3874,6 +3944,13 @@ impl Host {
                 relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
+            }
+        }
+        if late && staging_in_flight(runs) {
+            if relay_exact() {
+                relay_wait(WHY_READ, |_| !staging_in_flight(runs));
+            } else {
+                self.settle(&mut submitted, WHY_READ);
             }
         }
         let behind = late && flying();
@@ -3980,6 +4057,13 @@ impl Host {
         }
         let prepared = std::time::Instant::now();
         if late {
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::Texture(staging) = step {
+                        staging.mark_in_flight(this_submission);
+                    }
+                }
+            }
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {

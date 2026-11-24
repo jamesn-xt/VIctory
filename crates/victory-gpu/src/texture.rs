@@ -56,6 +56,9 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// Highest late-submission number (`crate::host::STARTED`) that may
+    /// still be reading this staging buffer on the GPU (`0` if none).
+    in_flight: std::sync::atomic::AtomicU64,
 }
 
 /// How long a texture whose hash changed is hashed at every check.
@@ -602,6 +605,19 @@ impl Staging {
         (self.memory as usize, self.layout.size as usize)
     }
 
+    /// Notes that late submission `submission` may still be reading this
+    /// staging buffer on the GPU.
+    pub(crate) fn mark_in_flight(&self, submission: u64) {
+        self.in_flight
+            .fetch_max(submission, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The highest late submission number that may still be reading this
+    /// staging buffer on the GPU (`0` if none).
+    pub(crate) fn in_flight(&self) -> u64 {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
@@ -1063,6 +1079,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        in_flight: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
